@@ -1,1 +1,334 @@
+import sqlite3
+import pandas as pd
+import urllib.request
 
+#Reading data from csv file
+csv_interns = "https://docs.google.com/spreadsheets/d/1iFFqsu_xruvVKzXAadAAlDBpIuU51v-pfIEU5HeGa8w/export?format=csv&gid=0"
+df = pd.read_csv(csv_interns) #dataframe
+
+#Code Identification
+
+swift_code = df["SWIFT CODE"] #series
+
+#Finding HQ codes
+hq_codes = [] #A list variable is declared and initialized to
+for code in swift_code:
+    code = str(code).strip() #str() to make sure it's a string and strip() to break the string into list of words
+    if "XXX" in code: #checks if it ends with XXX
+        hq_codes.append(code)
+        
+#Extracting first 8 characters of HQ codes           
+hq_prefix = []
+for hq in hq_codes:
+        hq_prefix.append(hq[:8])
+
+#Creating a function for identification
+def identify(swift_code_list):
+    for code in (swift_code_list):
+        code = str(code).strip() #to make sure it's a string
+        if "XXX" in code:
+            print("Bank's headquarters: " + code)
+        elif code[:8] in hq_prefix: #checking if first 8 chracters of code match with first 8 characters of HQ codes
+            print("Branch associated with headquarters: " + code)
+        else:
+            print("Bank's branch: " + code)
+   
+
+identify(swift_code[0:10]) #checks if function is working
+
+#Formatting
+df["COUNTRY ISO2 CODE"] = df["COUNTRY ISO2 CODE"].str.upper()
+df["NAME"] = df["NAME"].str.upper()
+
+
+con = sqlite3.connect("swift_data.db") #to create a connection to the database "swift_data.db"
+cursor = con.cursor()
+cursor.execute("DROP TABLE IF EXISTS swift_codes")
+#Creating a table
+cursor.execute(''' CREATE TABLE IF NOT EXISTS swift_codes (
+                    swift_code TEXT PRIMARY KEY,
+                    bank_name TEXT,
+                    address TEXT,
+                    country_iso2 TEXT,
+                    country_name TEXT,
+                    is_headquarter BOOLEAN
+                )
+                ''')
+
+for _, row in df.iterrows():
+    is_hq = 1 if row['SWIFT CODE'].endswith('XXX') else 0
+    bank_name = row.get('BANK NAME', '') 
+    address = row.get('ADDRESS', '')
+    name = row.get('NAME', '')
+    cursor.execute('''
+        INSERT INTO swift_codes 
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (
+        str(row['SWIFT CODE']).strip().upper(),
+        str(bank_name).strip(),
+        str(address).strip(),
+        str(row['COUNTRY ISO2 CODE']).strip().upper(),
+        str(name).strip(),
+        is_hq
+    ))
+
+#Creating indexes for fast querying
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_swift ON swift_codes(swift_code);")
+
+#checking what countries are in dataframe
+for country in sorted(df["COUNTRY ISO2 CODE"].unique()):
+    print(country)
+
+#checking if everything is working
+cursor.execute("SELECT * FROM swift_codes WHERE country_iso2 = 'PL'")
+results = cursor.fetchall()
+for row in results:
+    print(row)
+
+con.commit()
+cursor.close()
+con.close()
+
+import sqlite3
+#!pip install flask
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+#endpoint to get idividual SWIFT codes
+@app.route("/v1/swift-codes/<string:swift_code>",methods=['GET'])
+def get_swift(swift_code):
+    #connect to the database
+    con = sqlite3.connect("swift_data.db")
+    con.row_factory = sqlite3.Row  #allows accessing columns by name
+    cursor = con.cursor()
+    swift_code = swift_code.upper()
+    #executing the SQL query to retrieve the individual SWIFT code
+    try:
+        cursor.execute('SELECT * FROM swift_codes WHERE swift_code = ?', (swift_code,))
+        result = cursor.fetchone()
+    
+        if not result:
+            return jsonify({"error": "SWIFT code not found"}), 404
+        
+    #Build the response
+        response = {
+            "swiftCode": result["swift_code"],
+            "bankName": result["bank_name"],
+            "address": result["address"],
+            "countryISO2": result["country_iso2"].upper(),
+            "countryName": result["country_name"].upper(),                
+            "isHeadquarter": bool(result["is_headquarter"])
+        }
+    
+    #If it's a headquarter, include its branches
+        if result["is_headquarter"]:
+            hq_prefix = swift_code[:8]
+            cursor.execute("""
+                SELECT * FROM swift_codes 
+                WHERE swift_code LIKE ? AND swift_code != ?
+            """, (hq_prefix + "%", swift_code))
+
+            branches = []
+            for row in cursor.fetchall():
+                branches.append({
+                    "swiftCode": row["swift_code"],
+                    "bankName": row["bank_name"],
+                    "address": row["address"],
+                    "countryISO2": row["country_iso2"].upper(),
+                    "isHeadquarter": bool(row["is_headquarter"])
+                })
+            response["branches"] = branches
+
+        return jsonify(response)
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        con.close()   
+
+#returns all SWIFT codes with details for a specific country
+@app.route("/v1/swift-codes/country/<string:country_iso2>", methods=["GET"])
+def get_swift_codes_by_country(country_iso2):
+    country_iso2 = country_iso2.upper()  #always store and return uppercase
+    con = sqlite3.connect("swift_data.db")
+    con.row_factory = sqlite3.Row
+    cursor = con.cursor()
+
+    if len(country_iso2) != 2:
+        return jsonify({"error": "Invalid country ISO2 code"}), 400
+    
+    try:
+        #fetch all SWIFT codes for the country
+        cursor.execute('''SELECT * FROM swift_codes WHERE country_iso2 = ? ''', (country_iso2,))
+        results = cursor.fetchall()
+
+        if not results:
+            return jsonify({
+                "data": None,
+                "message": f"No SWIFT codes found for country {country_iso2}",
+                "error": None
+            }), 404
+            
+        #take the country name from the first entry (assuming all match)
+        country_name = results[0]["country_name"].upper()
+        swift_codes = []
+        
+        for result in results:
+            swift_codes.append({
+                "swiftCode": row["swift_code"],
+                "bankName": row["bank_name"],
+                "address": row["address"],
+                "countryISO2": row["country_iso2"].upper(),
+                "isHeadquarter": bool(row["is_headquarter"])
+            })
+
+        return jsonify({
+            "data": {
+                "countryISO2": country_iso2,
+                "countryName": country_name,
+                "swiftCodes": swift_codes
+            },
+            "message": "Success",
+            "error": None
+        })
+
+    except Exception as e:
+        return jsonify({
+            "data": None,
+            "message": "Failed to retrieve SWIFT codes",
+            "error": str(e)
+        }), 500
+
+    finally:
+        con.close()
+
+#Adds new SWIFT code entries 
+@app.route('/v1/swift-codes', methods=['POST'])
+def create_code():
+    #connect to the database
+    con = sqlite3.connect("swift_data.db")
+    cursor = con.cursor()
+
+    #get the swift code data from the request body
+    data = request.get_json()
+    #validate required fields
+    required_fields = ["swiftCode", "bankName", "address", "countryISO2", "countryName", "isHeadquarter"]
+    for field in required_fields:
+        if field not in data:
+            return jsonify({"error": f"Missing field: {field}"}), 400
+    try:
+        swift_code = data["swiftCode"].upper()
+        bank_name = data["bankName"]
+        address = data["address"]
+        country_iso2 = data["countryISO2"].upper()
+        country_name = data["countryName"].upper()
+        is_headquarter = bool(data["isHeadquarter"])
+
+        #execute the SQL query to insert a new SWIFT code
+        cursor.execute('''INSERT INTO swift_codes (swift_code, bank_name, address, country_iso2, country_name, is_headquarter) 
+        VALUES (?, ?, ?, ?, ?, ?)''', 
+        (swift_code, bank_name, address, country_iso2, country_name, is_headquarter))
+        con.commit()
+        
+        #return a success message
+        return jsonify({'message': 'SWIFT code created successfully'}), 201
+
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "SWIFT code already exists"}), 409
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cursor.close()
+        con.close()
+
+#deletes swift-code data if swiftCode matches the one in the database
+@app.route('/v1/swift-codes/<string:swift_code>', methods=['DELETE'])
+def delete_swift(swift_code):
+    #connect to the database
+    con = sqlite3.connect("swift_data.db")
+    cursor = con.cursor()
+
+    #execute the SQL query to delete the SWIFT code
+    cursor.execute('DELETE FROM swift_codes WHERE swift_code = ?', (swift_code,))
+    con.commit()
+
+    #return a success message
+    return jsonify({'message': 'SWIFT code deleted successfully'})
+
+#adding the following code to run the Flask application
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=8080)
+
+#Testing REST API
+!pip install pytest
+%%writefile test_swift_api.py
+import pytest
+from flask import Flask
+from app import app
+
+client = app.test_client()
+
+# Test: Valid POST
+response = client.post("/v1/swift-codes", json={
+    "swiftCode": "TESTUS00XXX",
+    "bankName": "Test Bank",
+    "address": "123 Test Street",
+    "countryISO2": "US",
+    "countryName": "UNITED STATES",
+    "isHeadquarter": True
+})
+print("POST status:", response.status_code)
+print("Response:", response.json)
+
+# Test: Get the HQ back with branches
+response = client.get("/v1/swift-codes/TESTUS00XXX")
+print("GET HQ status:", response.status_code)
+print("Data:", response.json)
+
+
+# Duplicate POST
+response = client.post("/v1/swift-codes", json={
+    "swiftCode": "TESTUS00XXX",
+    "bankName": "Test Bank",
+    "address": "123 Test Street",
+    "countryISO2": "US",
+    "countryName": "UNITED STATES",
+    "isHeadquarter": True
+})
+print("DUPLICATE POST status:", response.status_code)
+print("Response:", response.json)
+
+# GET non-existent code
+response = client.get("/v1/swift-codes/NONEXIST00XXX")
+print("GET non-existent status:", response.status_code)
+print("Response:", response.json)
+
+# DELETE non-existent code
+response = client.delete("/v1/swift-codes/NONEXIST00XXX")
+print("DELETE non-existent status:", response.status_code)
+print("Response:", response.json)
+
+# POST branch with no matching HQ
+response = client.post("/v1/swift-codes", json={
+    "swiftCode": "BRANCHONLY01AA",
+    "bankName": "Lone Branch Bank",
+    "address": "456 Side St",
+    "countryISO2": "GB",
+    "countryName": "UNITED KINGDOM",
+    "isHeadquarter": False
+})
+print("POST branch without HQ status:", response.status_code)
+print("Response:", response.json)
+
+#GET by branch
+response = client.get("/v1/swift-codes/BRANCHONLY01AA")
+print("GET branch-only status:", response.status_code)
+print("Data:", response.json)
+
+#GET by country
+response = client.get("/v1/swift-codes/country/US")
+print("GET by country status:", response.status_code)
+print("Response:", response.json)
