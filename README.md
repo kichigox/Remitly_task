@@ -10,10 +10,13 @@ This API allows you to:
 ## How to Run
 
 1. Install Flask (if needed)
+   
    In a Jupyter notebook cell, run:
+   
    !pip install flask
 
 2. Import and Run the Flask App
+   
   In another Jupyter notebook cell, set up and run the Flask app like this:
 
   Example for DELETE API:
